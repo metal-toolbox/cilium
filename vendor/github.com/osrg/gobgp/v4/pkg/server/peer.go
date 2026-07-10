@@ -248,17 +248,28 @@ func (peer *peer) getRoutesCount(family bgp.Family, dstPrefix string) uint8 {
 	return 0
 }
 
+func (peer *peer) advertisedPathID(path *table.Path) uint32 {
+	if peer.isAddPathSendEnabled(path.GetFamily()) {
+		return path.LocalID()
+	}
+	return 0
+}
+
 func (peer *peer) updateRoutes(paths ...*table.Path) {
 	if len(paths) == 0 {
 		return
 	}
 	for _, path := range paths {
-		localKey := path.GetLocalKey()
-		destLocalKey := localKey.PathDestLocalKey
+		if path == nil || path.IsEOR() {
+			continue
+		}
+		destLocalKey := path.GetDestLocalKey()
+		pathID := peer.advertisedPathID(path)
+
 		identifiersValue, destExists := peer.sentPaths.Load(destLocalKey)
 		if path.IsWithdraw && destExists {
 			identifiers := identifiersValue.(pathIDSet)
-			delete(identifiers, path.LocalID())
+			delete(identifiers, pathID)
 			if len(identifiers) == 0 {
 				peer.sentPaths.Delete(destLocalKey)
 			}
@@ -269,12 +280,10 @@ func (peer *peer) updateRoutes(paths ...*table.Path) {
 			} else {
 				identifiers = make(pathIDSet)
 			}
-			if len(identifiers) < int(peer.getAddPathSendMax(destLocalKey.Family)) {
-				identifiers[localKey.Id] = struct{}{}
-				if !destExists {
-					// store only the first insert, mutations are inplace
-					peer.sentPaths.Store(destLocalKey, identifiers)
-				}
+			identifiers[pathID] = struct{}{}
+			if !destExists {
+				// store only the first insert, mutations are inplace
+				peer.sentPaths.Store(destLocalKey, identifiers)
 			}
 		}
 	}
@@ -315,8 +324,13 @@ func (peer *peer) hasPathAlreadyBeenSent(path *table.Path) bool {
 	if !dstExist {
 		return false
 	}
-	_, pathExist := identifiers.(pathIDSet)[path.LocalID()]
+	_, pathExist := identifiers.(pathIDSet)[peer.advertisedPathID(path)]
 	return pathExist
+}
+
+func (peer *peer) resetAdvertisedRoutes() {
+	peer.sentPaths.Clear()
+	peer.sendMaxPathFiltered.Clear()
 }
 
 func (peer *peer) isDynamicNeighbor() bool {
@@ -335,29 +349,35 @@ func (peer *peer) setRtcEORWait(waiting bool) {
 	peer.fsm.logger.Debug("Set rtcEORWait", slog.Bool("Data", waiting))
 }
 
+// allNegotiatedEORReceived reports whether EOR has been received for all
+// negotiated GR address families. This applies the post-ESTABLISHED check
+// based on State (negotiated capabilities), not Config.
+func (peer *peer) allNegotiatedEORReceived() bool {
+	for _, a := range peer.fsm.pConf.ReadOnly().AfiSafis {
+		if s := a.MpGracefulRestart.State; s.Enabled && s.Received && !s.EndOfRibReceived {
+			return false
+		}
+	}
+	return true
+}
+
 // receivedAllEOR reports whether the restarting speaker has received EOR from
 // this peer for all negotiated GR address families. Per RFC 4724 Section 4.1,
 // a peer that does not advertise GR capability is excluded from the EOR wait.
 // A peer that has GR configured but has not yet reached ESTABLISHED is treated
 // as pending: its EOR has not been received and cannot be skipped.
 func (peer *peer) receivedAllEOR() bool {
-	conf := peer.fsm.pConf.ReadOnly()
 	if peer.fsm.state.Load() != bgp.BGP_FSM_ESTABLISHED {
 		// Session not yet established: if GR is configured for any family,
 		// we must wait — the peer may still advertise GR capability in its OPEN.
-		for _, a := range conf.AfiSafis {
+		for _, a := range peer.fsm.pConf.ReadOnly().AfiSafis {
 			if a.MpGracefulRestart.Config.Enabled {
 				return false
 			}
 		}
 		return true
 	}
-	for _, a := range conf.AfiSafis {
-		if s := a.MpGracefulRestart.State; s.Enabled && s.Received && !s.EndOfRibReceived {
-			return false
-		}
-	}
-	return true
+	return peer.allNegotiatedEORReceived()
 }
 
 func (peer *peer) configuredRFlist() []bgp.Family {
